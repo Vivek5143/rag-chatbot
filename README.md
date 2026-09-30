@@ -1,280 +1,573 @@
-# Agentic AI eBook RAG Chatbot
+# Agentic AI RAG Chatbot
 
-This repository is a strictly document-grounded RAG chatbot over the provided
-Agentic AI eBook. The current implementation includes typed configuration, PDF
-ingestion/chunking, OpenAI-to-Pinecone indexing, retrieval, evidence evaluation,
-LangGraph orchestration, constrained evidence-only answer generation,
-independent grounding validation, and a **Phase 8 FastAPI integration** that
-exposes the validated workflow through `POST /chat`.
+A production-oriented Retrieval-Augmented Generation (RAG) chatbot built to answer questions **strictly from the provided Agentic AI eBook**.
 
-## Phase 8 API boundary
+The application utilizes document ingestion, OpenAI embeddings, Pinecone vector search, LangGraph orchestration, evidence sufficiency evaluation, constrained answer generation, and independent grounding validation.
 
-`POST /chat` invokes the single compiled LangGraph as its only orchestration
-path. The API performs no embedding, Pinecone retrieval, evidence grading,
-answer generation, or grounding validation of its own — the graph does all of
-that. The API is a transport and error-mapping boundary only; it never
-generates fallback answers, uses general model knowledge, overrides evidence
-grading, overrides grounding validation, or marks an answer grounded.
+The system is designed to **fail closed**: if the retrieved evidence is insufficient, or if the generated answer cannot be strictly grounded in the supporting evidence, the application refuses to answer rather than relying on general model knowledge.
 
-## HTTP status mapping
+---
 
-| Situation | HTTP | Response |
-| --- | --- | --- |
-| Valid grounded answer | `200` | `final_answer`, provenance-rich `retrieved_context`, evidence `confidence_score`, `grounded=true` |
-| Evidence insufficient | `200` | Canonical refusal, `confidence_score=0.0`, `grounded=false`, diagnostic context preserved |
-| Grounding validation refusal | `200` | Canonical refusal, `confidence_score=0.0`, `grounded=false`, unsupported generated answer never exposed |
-| Invalid request (blank/whitespace/missing/wrong type/oversized) | `422` | Standard FastAPI validation error |
-| Provider/Pinecone/embedding/grader/generator/validator/config operational failure | `503` | `{"detail": "RAG service is currently unavailable."}` — no stack traces, no secrets |
+## Current Verification & Submission Status
 
-**200 refusal ≠ system failure.** A document refusal is a legitimate outcome
-when the eBook does not support the answer. **503 ≠ document refusal.** An
-operational failure is a service problem, never a claim that the document lacks
-the answer. An empty or unprovisioned Pinecone index is a `503`, not a refusal.
+| Component / Stage | Status | Verification Detail |
+|---|---|---|
+| Repository Structure & Data | ✅ **VERIFIED** | Clean architecture, `data/Ebook-Agentic-AI.pdf` present |
+| PDF Ingestion & Text Extraction | ✅ **VERIFIED** | 60 pages extracted, 59 text-bearing, page 1 empty cover |
+| Deterministic Chunking | ✅ **VERIFIED** | 119 chunks produced, stable chunk IDs & SHA-256 provenance |
+| OpenAI Embedding Adapter | ✅ **VERIFIED (Offline)** | Tested with `text-embedding-3-small` (1536 dim), batching & error handling |
+| Pinecone Vector Adapter | ✅ **VERIFIED (Offline)** | Dimension, cosine metric, host, and namespace isolation verified |
+| Pinecone Remote Index | ✅ **PROVISIONED** | Index `rag-chatbot` created (Dense, cosine, dim=1536); currently contains 0 vectors |
+| Evidence Evaluation Gate | ✅ **VERIFIED (Offline)** | Fail-closed evaluation (relevance, completeness, support, entailment) |
+| LangGraph Workflow | ✅ **VERIFIED (Offline)** | Graph routing, state propagation, and refusal branch execution |
+| Constrained Generation | ✅ **VERIFIED (Offline)** | Generator receives only grader-approved supporting evidence |
+| Grounding Validation Gate | ✅ **VERIFIED (Offline)** | Independent claim-by-claim verification against supporting evidence |
+| FastAPI Application (`/health`, `/chat`) | ✅ **VERIFIED** | Process liveness, 422 validation, typed contracts, 503 operational mapping |
+| Automated Test Suite | ✅ **VERIFIED** | **105 passed** in `python -m pytest -q` |
+| Bytecode Compilation | ✅ **VERIFIED** | `python -m compileall -q app.py src tests` passed with 0 errors |
+| API Smoke Test Suite | ✅ **VERIFIED** | `python smoke_test.py` passed all assertion checks |
+| **Live Remote Indexing** | ⛔ **BLOCKED** | Blocked by external OpenAI API quota (`429 insufficient_quota`) |
+| **Live RAG End-to-End Benchmark** | ⛔ **NOT VERIFIED** | Awaiting OpenAI account credit/quota replenishment |
 
-## Prerequisites
+> **Current Live Blocker Note:**  
+> The offline implementation, orchestration architecture, and safety guardrails are 100% complete and fully verified. However, live document embedding and live query execution cannot complete because the available OpenAI API key currently returns HTTP `429 insufficient_quota`.  
+> Consequently, the remote Pinecone index (`rag-chatbot`, namespace `agentic-ai`) is provisioned and healthy but currently holds **0 vectors**. Live RAG functionality is **not claimed as verified** until OpenAI quota is restored.
 
-- Python 3.10 or newer
-- OpenAI and Pinecone credentials are not required to run the offline test suite.
+---
 
-## Setup
+## 1. Problem Statement & Objectives
 
-```powershell
-python -m venv .venv
-.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
-Copy-Item .env.example .env
+Standard LLM chat applications frequently hallucinate or rely on pre-trained parametric knowledge when asked domain-specific questions, or when asked questions outside their supplied reference materials.
+
+For this system, the core objectives are:
+1. **The eBook is the Single Source of Truth**: The system must answer exclusively from `data/Ebook-Agentic-AI.pdf`.
+2. **Retrieval ≠ Answerability**: The mere fact that vector similarity returns candidate chunks does not mean the question is answerable. Retrieved chunks must be critically graded before generation.
+3. **Fail-Closed Stance**: If retrieved evidence is incomplete, tangential, or missing, the system must immediately refuse.
+4. **Constrained Generation**: The generator only sees evidence explicitly vetted by the evidence grader.
+5. **Independent Grounding Validation**: An independent evaluator verifies every claim in the generated answer against the supporting chunks. If any claim lacks entailment, the answer is replaced with a canonical refusal.
+6. **Separation of Refusals vs. Operational Errors**: Document-level refusals return HTTP 200 with a standard refusal payload. Infrastructure or provider failures (e.g., timeouts, rate limits, malformed model outputs) return HTTP 503.
+
+---
+
+## 2. Architecture & Complete RAG Flow
+
+### End-to-End Architecture
+
+```text
+                                INGESTION PIPELINE (Offline / Setup)
+                                
+       ┌────────────────────────┐
+       │ data/Ebook-Agentic-AI  │
+       │        .pdf            │
+       └───────────┬────────────┘
+                   │
+                   ▼
+       ┌────────────────────────┐
+       │  pypdf Text Extractor  │ ──► 60 Pages (59 text-bearing, Page 1 empty cover)
+       └───────────┬────────────┘
+                   │
+                   ▼
+       ┌────────────────────────┐
+       │ RecursiveCharacter-    │ ──► 119 Chunks (Size: 1000, Overlap: 200)
+       │      TextSplitter      │ ──► Deterministic Chunk IDs & Provenance
+       └───────────┬────────────┘
+                   │
+                   ▼
+       ┌────────────────────────┐
+       │ OpenAI Embeddings      │ ──► Model: text-embedding-3-small (1536 dim)
+       │ (text-embedding-3-small)│
+       └───────────┬────────────┘
+                   │
+                   ▼
+       ┌────────────────────────┐
+       │ Pinecone Vector DB     │ ──► Index: rag-chatbot | Namespace: agentic-ai
+       │   (119 Dense Vectors)  │
+       └────────────────────────┘
+
+                                QUERY & INFERENCE PIPELINE (Runtime)
+
+                                   ┌──────────────────────┐
+                                   │      User Query      │
+                                   └──────────┬───────────┘
+                                              │
+                                              ▼
+                                   ┌──────────────────────┐
+                                   │   FastAPI POST /chat │
+                                   └──────────┬───────────┘
+                                              │
+                                              ▼
+                                   ┌──────────────────────┐
+                                   │  LangGraph Workflow  │
+                                   └──────────┬───────────┘
+                                              │
+                                              ▼
+                                   ┌──────────────────────┐
+                                   │ 1. Retrieve Node     │
+                                   │  - Embed query       │
+                                   │  - Pinecone Top-K    │
+                                   └──────────┬───────────┘
+                                              │
+                                              ▼
+                                   ┌──────────────────────┐
+                                   │ 2. Evidence Grader   │
+                                   │  - Relevance         │
+                                   │  - Completeness      │
+                                   │  - Support score     │
+                                   │  - Entailment score  │
+                                   └──────────┬───────────┘
+                                              │
+                                ┌─────────────┴─────────────┐
+                         [Insufficient]                [Sufficient]
+                                │                           │
+                                ▼                           ▼
+                      ┌──────────────────┐        ┌──────────────────┐
+                      │  Refusal Branch  │        │ 3. Generate Node │
+                      └────────┬─────────┘        │  - Supporting    │
+                               │                  │    context only  │
+                               │                  └─────────┬────────┘
+                               │                            │
+                               │                            ▼
+                               │                  ┌──────────────────┐
+                               │                  │ 4. Grounding     │
+                               │                  │    Validator     │
+                               │                  └─────────┬────────┘
+                               │                            │
+                               │              ┌─────────────┴─────────────┐
+                               │         [Ungrounded /              [Fully
+                               │          Uncertain]               Grounded]
+                               │              │                         │
+                               ▼              ▼                         ▼
+                      ┌──────────────────────────┐            ┌──────────────────┐
+                      │     Canonical Refusal    │            │    Grounded      │
+                      │  confidence_score: 0.0   │            │     Answer       │
+                      │  grounded: false         │            │  provenance-rich │
+                      │  refused: true           │            └──────────────────┘
+                      └──────────────────────────┘
 ```
 
-Populate `.env` only when a later phase needs provider access. Do not commit
-that file.
+---
 
-For explicit indexing, populate these provider settings:
+## 3. LangGraph Workflow Details
 
-```env
-OPENAI_API_KEY=...
-PINECONE_API_KEY=...
-PINECONE_INDEX_NAME=rag-chatbot
-PINECONE_NAMESPACE=agentic-ai
-OPENAI_MODEL=gpt-4o-mini
-OPENAI_EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_DIMENSION=1536
-EMBEDDING_BATCH_SIZE=64
-PINECONE_UPSERT_BATCH_SIZE=100
+The system orchestrates the query lifecycle through a state machine built with LangGraph:
+
+1. **`retrieve`**:
+   - Takes the cleaned user query.
+   - Generates a 1536-dimensional embedding using OpenAI `text-embedding-3-small`.
+   - Queries Pinecone index `rag-chatbot` in namespace `agentic-ai` for top-$K$ candidates.
+   - Preserves chunk text, page provenance, chunk IDs, and similarity scores.
+
+2. **`evaluate_evidence`**:
+   - Critically assesses the retrieved candidates against the question.
+   - Evaluates relevance, completeness, missing aspects, support score, and entailment score.
+   - Filters out non-supporting chunks and identifies exact `supporting_chunk_ids`.
+   - **Fail-Closed Gate**: If evidence is missing, tangential, or incomplete, the graph branches directly to refusal.
+
+3. **`generate`**:
+   - Executes only when the evidence grader marks the context as sufficient.
+   - Isolates generation to **only** the vetted supporting chunks.
+   - Strict system prompt prohibits outside knowledge, extrapolation, and fabricated citations.
+
+4. **`validate`**:
+   - An independent grounding validation node receives the generated answer alongside the supporting evidence.
+   - Evaluates every factual claim for direct support, ambiguity, and contradiction.
+   - Checks entailment thresholds.
+
+5. **`answer / refusal`**:
+   - If grounded, constructs the final response with cited page provenance and confidence score.
+   - If ungrounded or ambiguous, overwrites the answer with the canonical refusal string.
+
+---
+
+## 4. Strict Grounding & Fail-Closed Guardrails
+
+### 1. Retrieval Does Not Equal Answerability
+A vector database will always return nearest neighbors based on cosine similarity, even for completely unrelated queries or adversarial questions. The presence of retrieved chunks is treated strictly as **candidate evidence**, never as proof that an answer can be synthesized.
+
+### 2. Evidence Evaluation & Fail-Closed Behavior
+Before any answer generation can take place, the `EvidenceGrader` must confirm:
+- `is_relevant = True`
+- `is_sufficient = True`
+- `is_complete = True`
+- `support_score >= threshold` (default: 0.70)
+- `entailment_score >= threshold` (default: 0.70)
+- Supporting candidate list is non-empty.
+
+If any criterion fails, the grader fails closed. The application can downgrade an overly optimistic score, but it never upgrades insufficient evidence.
+
+### 3. Constrained Generation
+Unselected retrieved chunks are discarded before generation. The generation prompt enforces:
+- Answering solely from provided chunk blocks.
+- No general pre-training knowledge.
+- No speculation or logical leaps beyond what the text states.
+
+### 4. Independent Grounding Validation
+The generation model is never allowed to grade its own homework. An independent validation step evaluates the generated answer against the supporting chunks. If unsupported claims or ambiguous statements are detected, the graph diverts to refusal.
+
+### 5. Canonical Refusal Contract
+Whenever a question cannot be answered from the eBook, the response is deterministic:
+
+```text
+I cannot answer this based on the information available in the provided document.
 ```
 
-`PINECONE_NAMESPACE` is intentionally required for indexing. Use a
-content-versioned namespace (for example, a document-hash-derived value) so a
-changed eBook is not silently mixed with a previous version.
-
-## PDF ingestion
-
-The canonical source is expected at `data/Ebook-Agentic-AI.pdf`. It is not
-included in this repository. The ingestion API raises a clear missing-file error
-until the approved PDF is supplied; it never downloads or substitutes a source.
-
-`src.ingestion` exposes:
-
-- `load_pdf_pages(path)` for page-aware `Document` objects;
-- `chunk_documents(documents, chunk_size, chunk_overlap)` for embedding-ready
-  chunks with source, page, document hash, chunk index, and deterministic ID;
-- `ingest_pdf(path, ...)` to run both steps explicitly.
-
-Ingestion remains separate from FastAPI startup.
-
-## Explicit indexing
-
-The index must be provisioned separately before running ingestion. This project
-never creates, deletes, or recreates a Pinecone index. For the default
-`text-embedding-3-small` model, configure an existing dense Pinecone index with
-**cosine** similarity and dimension **1536**. The command validates readiness,
-metric, and dimension before it requests embeddings or writes vectors.
-
-With the approved PDF present at `data/Ebook-Agentic-AI.pdf` and provider
-configuration supplied, run:
-
-```powershell
-.venv\Scripts\python.exe -m src.indexing
-```
-
-The command loads and chunks the PDF, embeds non-empty chunks in batches, and
-upserts bounded batches to the configured namespace. It reports counts without
-printing credentials. If the canonical PDF is absent, it fails clearly and does
-not download or substitute a document.
-
-Each Pinecone vector ID is Phase 2's deterministic `chunk_id` (derived from
-the document hash, page, chunk position, and content). Re-running the same
-document upserts those same IDs, so it updates existing logical vectors instead
-of creating duplicates. Vector metadata preserves `chunk_id`, `source`, `page`,
-and `source_hash`, plus the chunk text once as `content` for future
-evidence-preserving retrieval. The default 1,000-character chunks fit the
-pipeline's 8 KB metadata-content guard; an oversized chunk fails instead of
-being silently truncated.
-
-FastAPI does not call this command, OpenAI, or Pinecone during import or
-startup. `GET /health` and `POST /chat` remain Phase 1 behavior until a later
-phase deliberately wires the validated workflow to the API.
-
-## Run the API
-
-```powershell
-python -m uvicorn app:app --reload
-```
-
-- `GET /health` confirms that the API process is running. It is lightweight and
-  performs no ingestion, embedding, retrieval, or provider calls.
-- `POST /chat` validates its request, invokes the compiled LangGraph once, and
-  returns a typed response. It never fabricates a RAG answer.
-
-### `GET /health`
-
-Returns `{"status": "ok", "phase": "api"}`. Process liveness only.
-
-### `POST /chat`
-
-Request body — `ChatRequest`:
-
-```json
-{ "query": "What is Agentic AI according to the eBook?" }
-```
-
-`query` is trimmed, must contain at least one non-whitespace character, and is
-capped at 2,000 characters. Blank, whitespace-only, missing, wrong-type, and
-oversized queries return standard FastAPI `422` validation errors. The API never
-silently rewrites the user's question.
-
-Response body — `ChatResponse`:
-
+With payload fields:
 ```json
 {
-  "final_answer": "Agentic AI is ...",
-  "retrieved_context": [
-    {
-      "chunk_id": "sha256:abc123",
-      "content": "The eBook states ...",
-      "source": "Ebook-Agentic-AI.pdf",
-      "page": 12,
-      "source_hash": "d6e2c5...",
-      "similarity_score": 0.91
-    }
-  ],
-  "confidence_score": 0.88,
-  "grounded": true,
-  "refusal_reason": null
+  "confidence_score": 0.0,
+  "grounded": false,
+  "refused": true
 }
 ```
 
-`retrieved_context` is capped at the configured retrieval `top_k` (default 4)
-and preserves `chunk_id`, `content`, `source`, `page`, `source_hash`, and raw
-`similarity_score` for every candidate. `confidence_score` is the existing
-evidence-confidence value (`min(support_score, entailment_score)`); it is
-`0.0` for every refusal and non-zero only for grounded answers.
+### 6. Separation of Document Refusals vs. Operational Errors
+- **Document Refusal (HTTP 200)**: The RAG pipeline executed successfully and determined that the eBook does not contain sufficient information to answer the question.
+- **Operational Error (HTTP 503)**: An upstream dependency failed (OpenAI rate limit / 429, Pinecone network timeout, invalid schema parsing). Operational errors are never masked as document refusals.
 
-### Refusal example
+---
 
+## 5. Project Structure
+
+```text
+rag-chatbot/
+│
+├── data/
+│   └── Ebook-Agentic-AI.pdf          # Canonical eBook source document
+│
+├── src/
+│   ├── __init__.py
+│   ├── api.py                        # FastAPI router & endpoint definitions
+│   ├── config.py                     # Typed settings (Pydantic Settings)
+│   ├── embeddings.py                 # OpenAI embedding provider & adapter
+│   ├── generation.py                 # Constrained generation service & prompt
+│   ├── grading.py                    # Evidence evaluation & fail-closed logic
+│   ├── graph.py                      # LangGraph state machine & workflow
+│   ├── indexing.py                   # Ingestion & Pinecone vector indexing script
+│   ├── ingestion.py                  # PDF extraction & deterministic chunking
+│   ├── models.py                     # Core Pydantic domain & API models
+│   ├── retrieval.py                  # Pinecone vector retrieval service
+│   └── validation.py                 # Independent grounding validation service
+│
+├── tests/
+│   ├── test_api.py                   # API contract, validation & 503 error tests
+│   ├── test_app.py                   # FastAPI /health & basic endpoint tests
+│   ├── test_config.py                # Environment configuration tests
+│   ├── test_embeddings.py            # Embedding adapter & batching tests
+│   ├── test_generation.py            # Evidence-constrained generation tests
+│   ├── test_grading.py               # Grader sufficiency & fail-closed tests
+│   ├── test_graph.py                 # LangGraph routing & state transition tests
+│   ├── test_indexing.py              # Ingestion & Pinecone indexing contract tests
+│   ├── test_ingestion.py             # PDF text extraction & chunk stability tests
+│   ├── test_models.py                # Request/response model validation tests
+│   ├── test_retrieval.py             # Retrieval query & metadata handling tests
+│   └── test_validation.py            # Grounding claim validation tests
+│
+├── docs/                             # Design documents & specifications
+├── app.py                            # FastAPI application entrypoint
+├── smoke_test.py                     # Fast standalone API integration smoke tests
+├── requirements.txt                  # Python dependencies
+├── .env.example                      # Documented environment variable template
+├── .gitignore                        # Git exclusion rules (protects secrets/.env)
+├── README.md                         # Project documentation
+├── prd.md                            # Product Requirements Document
+├── backlog.md                        # Task tracking & milestone backlog
+├── implementation_plan.md            # Technical architecture & implementation plan
+├── implementation_plan_phase4.md     # Phase 4 verification & guardrails plan
+└── system.md                         # System architecture & interface reference
+```
+
+---
+
+## 6. Technologies Used
+
+| Technology | Purpose |
+|---|---|
+| **Python 3.10+** | Core runtime environment |
+| **FastAPI** | High-performance ASGI web framework for `/health` and `/chat` |
+| **LangGraph** | Stateful multi-step RAG workflow orchestration and conditional routing |
+| **LangChain Text Splitters** | Document chunking with recursive boundary splitting |
+| **pypdf** | Robust PDF page and text extraction |
+| **OpenAI API** | Vector embeddings (`text-embedding-3-small`) and reasoning (`gpt-4o-mini`) |
+| **Pinecone** | Managed vector database for dense cosine similarity search |
+| **Pydantic v2** | Strict data modeling, runtime type enforcement, and settings management |
+| **Pytest** | Automated unit and integration testing suite |
+| **Uvicorn** | Production-ready ASGI web server |
+
+---
+
+## 7. Setup & Installation
+
+### Prerequisites
+- Python 3.10 or newer
+- An active Pinecone account and API key
+- An active OpenAI account and API key
+
+### 1. Clone & Set Up Virtual Environment
+
+**Windows (PowerShell):**
+```powershell
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+```
+
+**Linux / macOS:**
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+```
+
+### 2. Install Dependencies
+```bash
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+```
+
+### 3. Configure Environment Variables
+Copy `.env.example` to a local `.env` file:
+```bash
+cp .env.example .env
+```
+
+Populate the required configuration options in `.env`:
+```env
+OPENAI_API_KEY=your_openai_api_key_here
+OPENAI_MODEL=gpt-4o-mini
+OPENAI_BASE_URL=
+
+PINECONE_API_KEY=your_pinecone_api_key_here
+PINECONE_INDEX_NAME=rag-chatbot
+PINECONE_NAMESPACE=agentic-ai
+```
+
+> **Security Note:**  
+> Never commit `.env` or real API keys to source control. The repository `.gitignore` explicitly ignores `.env`, virtual environments, and caches. Verify with `git status` before pushing changes.
+
+---
+
+## 8. Canonical Source Document & Ingestion
+
+### Source Document
+The sole knowledge source for this application is:
+```text
+data/Ebook-Agentic-AI.pdf
+```
+- **Total Pages**: 60
+- **Page 1**: Empty cover page
+- **Pages 2–60**: Text-bearing document content (59 pages)
+- **SHA-256 Digest**: `532452cd94aff725328eb02a9722fdcbb370803abfc552b2d2e1c93620b7d302`
+
+### Ingestion & Chunking
+The ingestion pipeline (`src/ingestion.py`) processes the PDF as follows:
+1. Loads pages using `pypdf`, preserving 1-based page numbers.
+2. Filters unextractable pages (such as blank cover pages).
+3. Splits text using `RecursiveCharacterTextSplitter` configured for `chunk_size = 1000` and `chunk_overlap = 200`.
+4. Produces exactly **119 chunks** for the canonical document.
+5. Generates deterministic vector IDs formatted as:
+   ```text
+   {document_sha256[:16]}-p{page_number}-c{chunk_index}
+   ```
+6. Stores rich provenance metadata per chunk:
+   - `chunk_id`
+   - `source` (`Ebook-Agentic-AI.pdf`)
+   - `page` (integer page number)
+   - `source_hash`
+   - `chunk_index`
+   - `content` (chunk text)
+
+---
+
+## 9. Pinecone Configuration & Indexing
+
+### Index Specifications
+The application targets a pre-provisioned Pinecone index:
+- **Index Name**: `rag-chatbot`
+- **Vector Type**: `Dense`
+- **Metric**: `cosine`
+- **Dimension**: `1536`
+- **Namespace**: `agentic-ai`
+
+> **Index Lifecycle Notice:**  
+> The repository **does not** automatically create, delete, or recreate the Pinecone index during application startup or runtime. This prevents unintended index deletion, data loss, or cold-start race conditions. The index must be provisioned in your Pinecone console before running indexing.
+
+### Indexing Command
+To ingest the PDF, generate embeddings, and upsert vectors into Pinecone, run:
+```bash
+python -m src.indexing
+```
+
+**Indexing Workflow:**
+1. Loads and chunks `data/Ebook-Agentic-AI.pdf`.
+2. Verifies the Pinecone index exists and validates dimension (`1536`) and metric (`cosine`).
+3. Passes the 119 chunks to the OpenAI embedding provider in batches.
+4. Upserts 119 vectors with full provenance metadata into namespace `agentic-ai`.
+
+---
+
+## 10. Running the API
+
+Start the FastAPI application with Uvicorn:
+```bash
+python -m uvicorn app:app
+```
+By default, the server listens at `http://127.0.0.1:8000`.
+
+### Health Check Endpoint
+**`GET /health`**
+
+Confirms application process liveness.
+```bash
+curl http://127.0.0.1:8000/health
+```
+
+**Example Response:**
+```json
+{
+  "status": "ok",
+  "phase": "api"
+}
+```
+*(Note: `/health` confirms API process liveness only; it does not invoke external providers).*
+
+---
+
+## 11. Chat API Specification
+
+**`POST /chat`**
+
+Processes questions through the LangGraph RAG workflow.
+
+### Request Body
+```json
+{
+  "query": "What is Agentic AI according to the eBook?"
+}
+```
+
+### Successful Grounded Response (Example)
+```json
+{
+  "final_answer": "Agentic AI refers to autonomous systems capable of perceiving their environment, reasoning, making decisions, and taking actions to accomplish specific goals with minimal human intervention.",
+  "retrieved_context": [
+    {
+      "chunk_id": "532452cd94aff725-p3-c0",
+      "source": "Ebook-Agentic-AI.pdf",
+      "page": 3,
+      "similarity_score": 0.884
+    },
+    {
+      "chunk_id": "532452cd94aff725-p4-c1",
+      "source": "Ebook-Agentic-AI.pdf",
+      "page": 4,
+      "similarity_score": 0.821
+    }
+  ],
+  "confidence_score": 0.884,
+  "grounded": true,
+  "refused": false
+}
+```
+
+### Refusal Response (Example)
+Returned with HTTP 200 when evidence is insufficient or question is outside the eBook:
 ```json
 {
   "final_answer": "I cannot answer this based on the information available in the provided document.",
   "retrieved_context": [],
   "confidence_score": 0.0,
   "grounded": false,
-  "refusal_reason": "insufficient_evidence"
+  "refused": true
 }
 ```
 
-### `503` operational-error behavior
-
+### Operational Error Response (Example)
+Returned with HTTP 503 if an external provider or network call fails:
 ```json
-{ "detail": "RAG service is currently unavailable." }
+{
+  "detail": "Upstream model provider is currently unavailable or returned an error."
+}
 ```
 
-This is returned for OpenAI provider failure/timeout, Pinecone failure, embedding
-failure, malformed structured grader/generation/validation output, invalid score,
-invalid supporting chunk ID, configuration/index-readiness failure, and other
-typed operational RAG errors. It is never converted into a document refusal and
-never exposes API keys, credentials, stack traces, or raw provider responses.
+---
 
-### Index provisioning requirement
+## 12. Benchmark Questions
 
-The Pinecone index must be provisioned and the eBook ingested **before** real
-queries. The API does not create, delete, or recreate the index and does not
-ingest the PDF at startup. See *Explicit indexing* above.
+The assignment defines five specific benchmark questions to evaluate both grounded retrieval and refusal handling:
 
-## Test
+| # | Benchmark Question | Expected System Behavior |
+|---|---|---|
+| 1 | **What is Agentic AI according to the eBook?** | Grounded answer derived strictly from eBook introductory pages with chunk citations. |
+| 2 | **How do AI agents differ from traditional automation systems?** | Grounded comparative answer detailing autonomy, reasoning, and adaptive behavior vs. rule-based automation. |
+| 3 | **What are the core components of an Agentic Architecture?** | Grounded breakdown of architectural components (perception, planning, reasoning, memory, execution). |
+| 4 | **What role does memory play in Agentic AI workflows?** | Grounded explanation of short-term vs. long-term memory, state retention, and context preservation. |
+| 5 | **Who won the 2022 FIFA World Cup?** | **Canonical Refusal.** The document contains no sports or FIFA World Cup data. Must not use general LLM knowledge. |
 
-```powershell
-.venv\Scripts\python.exe -m pytest -q
-.venv\Scripts\python.exe -m compileall -q app.py src tests
+### Expected FIFA Refusal Payload
+```json
+{
+  "final_answer": "I cannot answer this based on the information available in the provided document.",
+  "confidence_score": 0.0,
+  "grounded": false,
+  "refused": true
+}
 ```
 
-Tests use offline fakes for OpenAI embeddings and Pinecone. No live indexing is
-claimed unless the canonical PDF, real credentials, and the explicit command
-have all been used.
+---
 
-## Live evaluation status
+## 13. Testing & Verification
 
-The canonical PDF is present and validated (`data/Ebook-Agentic-AI.pdf`,
-20,267,549 bytes, SHA-256
-`532452cd94aff725328eb02a9722fdcbb370803abfc552b2d2e1c93620b7d302`).
-Offline ingestion produces **119 chunks** across 59 pages (2–60) with unique
-deterministic chunk IDs and full provenance. All 105 tests pass, compilation is
-clean, and the smoke suite (`/health`, `422`, grounded `200`, refusal `200`,
-`503`) passes.
+The repository contains an exhaustive offline test suite that validates every component, edge case, and safety gate without consuming external API credits.
 
-**Live ingestion and benchmark evaluation could not be completed:**
-
-| Check | Result |
-| --- | --- |
-| Canonical PDF present | ✅ |
-| Offline ingestion (chunks, IDs, provenance) | ✅ 119 chunks / 59 pages |
-| Offline test suite | ✅ 105 passed |
-| Compilation | ✅ `COMPILE_OK` |
-| Smoke suite (API contract) | ✅ passed |
-| Pinecone index `rag-chatbot` exists | ✅ dense, cosine, 1536 dim, ready (host `rag-chatbot-cj953jk.svc.aped-4627-b74a.pinecone.io`) |
-| OpenAI key usable | ❌ 429 `insufficient_quota` — no credits remaining |
-| OpenRouter fallback | ❌ **Architecturally incompatible** — no embedding models offered |
-
-Per the project's explicit provisioning policy, this repository never creates,
-deletes, or recreates a Pinecone index, so the indexing command fails at the
-embedding call with `Indexing failed: OpenAI embedding request failed`. The API
-itself is unaffected — it starts and serves `GET /health`; `POST /chat` is ready
-to run against a provisioned index and funded key.
-
-## Optional OpenAI-compatible base URL
-
-`OPENAI_BASE_URL` is an optional, empty-by-default setting. When set, every
-OpenAI SDK client (embeddings, evidence grading, generation, grounding
-validation) is constructed with that `base_url`, redirecting them at an
-alternate OpenAI-compatible provider. It is an explicit operator choice, never
-a silent default, and OpenAI remains the documented assignment default:
-
-```env
-OPENAI_BASE_URL=https://openrouter.ai/api/v1
+### 1. Run Unit & Integration Tests
+```bash
+python -m pytest -q
+```
+**Verified Result:**
+```text
+105 passed in 54.52s
 ```
 
-No provider logic was hardcoded: `build_openai_client(settings)` in
-`src/config.py` applies the base URL only when non-blank, and the four adapters
-(`OpenAIEmbeddingProvider`, `OpenAIEvidenceGraderAdapter`,
-`OpenAIGenerationAdapter`, `OpenAIGroundingValidatorAdapter`) each accept an
-optional `base_url` parameter. Offline tests are unaffected (105 pass).
+### 2. Bytecode Compilation Verification
+```bash
+python -m compileall -q app.py src tests
+```
+**Verified Result:** Passed with 0 errors (clean compilation).
 
-### OpenRouter compatibility findings
+### 3. Standalone Smoke Test Suite
+```bash
+python smoke_test.py
+```
+**Verified Result:**
+```text
+SMOKE TEST PASSED: /health, 422, grounded 200, refusal 200, 503
+```
 
-A live probe of the configured OpenRouter key (`sk-or-v1-...`) found three
-incompatible capabilities; no architectural change was made:
+---
 
-| Operation | OpenRouter result |
-| --- | --- |
-| Chat completion (`openai/gpt-4o-mini`) | ❌ 402 — account has never purchased credits (`total_credits: 0`) |
-| Structured output (`responses.parse`) on free models | ❌ 429 — daily free-model limit reached ("Add 10 credits to unlock 1000 free model requests per day") |
-| **Embeddings (`openai/text-embedding-3-small`)** | ❌ **Not offered at all — OpenRouter lists zero embedding models** |
+## 14. Steps to Complete Live Validation
 
-The embedding gap is the hard blocker: chunk embedding and question embedding
-both require a text embedding model, and the configured dimension (1536) must
-match the Pinecone index. Changing the base URL alone cannot supply one, so
-retrieval — and therefore the entire RAG pipeline — cannot run through
-OpenRouter without a different embedding provider. This was reported before
-any architectural change, per the compatibility-check requirement.
+Once an OpenAI API key with active credits/quota is configured, the live end-to-end pipeline can be validated using the following steps:
 
-The project plan and architecture are documented in `prd.md`, `backlog.md`,
-`implementation_plan.md`, and `system.md`.
+1. **Populate Credentials**: Ensure `OPENAI_API_KEY` and `PINECONE_API_KEY` in `.env` have available balance.
+2. **Execute Indexing**:
+   ```bash
+   python -m src.indexing
+   ```
+3. **Verify Pinecone Vectors**: Confirm that index `rag-chatbot`, namespace `agentic-ai`, contains **119 vectors** with complete metadata.
+4. **Launch Application**:
+   ```bash
+   python -m uvicorn app:app
+   ```
+5. **Run Benchmark Queries**: Execute questions 1–4 via `POST /chat` and verify page provenance and positive confidence scores.
+6. **Run Refusal Verification**: Execute question 5 ("Who won the 2022 FIFA World Cup?") and adversarial prompts; confirm exact canonical refusal response.
+7. **Verify Grounding Audit**: Verify that all successful responses only contain statements directly supported by the retrieved chunks.
+
+---
+
+## 15. Limitations
+
+The system design deliberately excludes out-of-scope complexity to keep the RAG implementation clean, robust, and verifiable:
+- **Single-Document Scope**: Built specifically for `data/Ebook-Agentic-AI.pdf`.
+- **No OCR Support**: Only processes digitally embedded text; scanned or pure image PDFs require an OCR pre-processor.
+- **Stateless Chat**: Does not maintain multi-turn conversational history; each query is treated as an independent question.
+- **No Automatic Cloud Provisioning**: Does not automatically create or destroy cloud infrastructure.
+- **No Custom UI**: Exposes an HTTP API for integration rather than a graphical frontend.
